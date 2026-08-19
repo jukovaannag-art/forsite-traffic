@@ -1,0 +1,39 @@
+name: Сбор баллов пробок (Иркутск)
+
+on:
+  schedule:
+    - cron: "0 0-15,23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-traffic
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Снять балл пробок
+        run: python collect.py
+
+      - name: Закоммитить новые строки
+        run: |
+          if [ -z "$(git status --porcelain -- data/traffic_irkutsk.csv)" ]; then
+            echo "Новых строк нет, коммит не нужен."
+            exit 0
+          fi
+          git config user.name "traffic-bot"
+          git config user.email "traffic-bot@users.noreply.github.com"
+          git add data/traffic_irkutsk.csv
+          git commit -m "Пробки Иркутск: $(TZ=Asia/Irkutsk date '+%Y-%m-%d %H:00')"
+          git pull --rebase --autostash
+          git push

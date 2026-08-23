@@ -18,7 +18,6 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = Path(os.environ.get("TRAFFIC_CSV") or ROOT / "data" / "traffic_irkutsk.csv")
 
 HOUR_FROM, HOUR_TO = 7, 23
-HOURS_PER_DAY = HOUR_TO - HOUR_FROM + 1
 
 # Цвета источников закреплены за источником, а не за порядком в фильтре.
 # Пара проверена на различимость при дальтонизме (ΔE 32 protan).
@@ -54,6 +53,25 @@ def daily_average(frame: pd.DataFrame) -> pd.DataFrame:
     )
     grouped["score"] = grouped["score"].round(2)
     return grouped
+
+
+def expected_slots(frame: pd.DataFrame, sources: int) -> int:
+    """Сколько замеров можно было снять за период.
+
+    Полные сутки внутри периода считаются целиком, края - от первого и до
+    последнего фактического замера. Иначе первый день сбора и текущий,
+    ещё не закончившийся, всегда штрафуют полноту за часы, которых не было.
+    """
+    first_date, last_date = min(frame["date"]), max(frame["date"])
+    first_hour = int(frame[frame["date"] == first_date]["hour"].min())
+    last_hour = int(frame[frame["date"] == last_date]["hour"].max())
+    total, day = 0, first_date
+    while day <= last_date:
+        low = first_hour if day == first_date else HOUR_FROM
+        high = last_hour if day == last_date else HOUR_TO
+        total += max(0, min(high, HOUR_TO) - max(low, HOUR_FROM) + 1)
+        day += timedelta(days=1)
+    return total * sources
 
 
 def style_axes(figure: go.Figure, y_title: str = "Балл пробок") -> go.Figure:
@@ -137,7 +155,8 @@ def heatmap(frame: pd.DataFrame, source: str) -> go.Figure:
 def main() -> None:
     st.title("🚦 Пробки Иркутска")
     st.caption(
-        "Балл пробок снимается каждый час с 7:00 до 23:00 по Иркутску. "
+        "Балл пробок снимается раз в час с 7:00 до 23:00 по Иркутску "
+        "(сборщик пробует каждые 20 минут, в час засчитывается первый удачный замер). "
         "Источники считают по своим методикам - смотреть их рядом, а не смешивать."
     )
 
@@ -145,7 +164,7 @@ def main() -> None:
     if frame.empty:
         st.warning(
             f"Данных пока нет. Файл `{DATA_PATH}` пуст или отсутствует. "
-            "Запустите `python collect.py --force`."
+            "Запустите `python collect.py`."
         )
         return
 
@@ -168,6 +187,11 @@ def main() -> None:
 
     period = frame if days is None else frame[frame["date"] > last_date - timedelta(days=days)]
     period = period[period["source"].isin(chosen)] if chosen else period.iloc[0:0]
+    # Замеры вне 7:00-23:00 - это опоздавшие запуски сборщика, сползшие за
+    # полночь. В средние и в полноту они не идут, но и не пропадают: счётчик
+    # под таблицей показывает, сколько их.
+    outside = period[~period["hour"].between(HOUR_FROM, HOUR_TO)]
+    period = period[period["hour"].between(HOUR_FROM, HOUR_TO)]
     if period.empty:
         st.info("За выбранный период и источники данных нет.")
         return
@@ -189,17 +213,18 @@ def main() -> None:
         column.caption(f"последний замер {last_score:g} в {last_time}")
     tiles[-2].metric("Среднее за период", f"{period['score'].mean():.2f}")
 
-    # Считаем от календарных дней периода, а не от дней с данными: иначе
-    # полностью пропущенные сутки не видны - процент останется высоким.
+    # Дни внутри периода считаются целиком, поэтому полностью пропущенные
+    # сутки видны. Края - по факту первого и последнего замера.
     span_days = (last_date - min(period["date"])).days + 1
-    expected = span_days * HOURS_PER_DAY * max(len(chosen), 1)
+    expected = expected_slots(period, max(len(chosen), 1))
     coverage = len(period) / expected * 100 if expected else 0
     tiles[-1].metric(
         "Полнота сбора",
         f"{coverage:.0f}%",
         help=(
             f"{len(period)} замеров из {expected} возможных за {span_days} дн. "
-            f"Последнее измерение: {latest_ts}"
+            "Первый и последний день периода считаются от фактического замера, "
+            f"а не от 7:00 и 23:00. Последнее измерение: {latest_ts}"
         ),
     )
 
@@ -238,11 +263,10 @@ def main() -> None:
             mime="text/csv",
         )
 
-    gaps = period[~period["hour"].between(HOUR_FROM, HOUR_TO)]
-    if not gaps.empty:
+    if not outside.empty:
         st.caption(
-            f"В данных есть {len(gaps)} измерений вне окна 7:00-23:00 - "
-            "скорее всего, ручные прогоны с --force."
+            f"Ещё {len(outside)} измерений пришлись на время вне окна 7:00-23:00 - "
+            "запуски сборщика, опоздавшие за полночь. В средние они не вошли."
         )
 
 

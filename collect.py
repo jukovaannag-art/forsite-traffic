@@ -1,7 +1,11 @@
 """Снимает балл пробок по Иркутску с Яндекса и 2ГИС и дописывает в CSV.
 
-Запускается раз в час с 7:00 до 23:00 по Иркутску (GitHub Actions, см.
-.github/workflows/collect.yml). Локально: python collect.py --force
+Запускается каждые 20 минут в окне 7:00-23:00 по Иркутску (GitHub Actions, см.
+.github/workflows/collect.yml). Локально: python collect.py
+
+Записывает всегда, в любой час. Окно задаёт расписание, а не сам скрипт:
+опоздавший запуск раньше отбрасывался целиком, хотя источники ему ответили.
+Отсечка 7:00-23:00 живёт на дашборде, там же видны сползшие замеры.
 
 Балл - целое 0-10 у обоих источников, но методики разные, поэтому значения
 не смешиваются: каждая строка помечена источником, сравнение только рядом.
@@ -20,8 +24,6 @@ from collector.storage import upsert
 # Иркутск - UTC+8 круглый год, перевода часов нет.
 IRKUTSK_TZ = timezone(timedelta(hours=8), name="Asia/Irkutsk")
 
-HOUR_FROM = 7
-HOUR_TO = 23  # включительно
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "traffic_irkutsk.csv"
 
@@ -55,23 +57,11 @@ def collect(now_local: datetime) -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--force",
-        action="store_true",
-        help=f"записать, даже если сейчас не {HOUR_FROM}:00-{HOUR_TO}:59 по Иркутску",
-    )
-    parser.add_argument(
         "--out", type=Path, default=DATA_PATH, help="путь к CSV с историей"
     )
     args = parser.parse_args()
 
     now_local = datetime.now(IRKUTSK_TZ)
-    if not args.force and not (HOUR_FROM <= now_local.hour <= HOUR_TO):
-        print(
-            f"Сейчас {now_local:%H:%M} по Иркутску - вне окна "
-            f"{HOUR_FROM}:00-{HOUR_TO}:59, ничего не пишу."
-        )
-        return 0
-
     rows = collect(now_local)
     added, replaced = upsert(args.out, rows)
     print(

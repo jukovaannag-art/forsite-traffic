@@ -2,8 +2,12 @@ name: Сбор баллов пробок (Иркутск)
 
 on:
   schedule:
-    - cron: "0 0-15,23 * * *"
-  workflow_dispatch:
+    # Иркутск = UTC+8 круглый год. Локальные 7:00-23:00 -> UTC 23:00 и 00:00-15:00.
+    # Каждые 20 минут, а не раз в час: GitHub молча выбрасывает часть тиков по
+    # расписанию, и один пропуск стоил целого часа. Три попытки на час - дубли
+    # схлопывает upsert по (дата, час, источник), лишний прогон ничего не пишет.
+    - cron: "*/20 0-15,23 * * *"
+  workflow_dispatch: # кнопка "Run workflow" для ручного прогона
 
 permissions:
   contents: write
@@ -22,11 +26,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Зависимостей у сборщика нет - только стандартная библиотека.
       - name: Снять балл пробок
         run: python collect.py
 
       - name: Закоммитить новые строки
         run: |
+          # --porcelain, а не git diff: на первом запуске файл может быть
+          # ещё не отслеживаемым, и git diff не заметил бы его появления.
           if [ -z "$(git status --porcelain -- data/traffic_irkutsk.csv)" ]; then
             echo "Новых строк нет, коммит не нужен."
             exit 0
@@ -35,5 +42,6 @@ jobs:
           git config user.email "traffic-bot@users.noreply.github.com"
           git add data/traffic_irkutsk.csv
           git commit -m "Пробки Иркутск: $(TZ=Asia/Irkutsk date '+%Y-%m-%d %H:00')"
+          # Между запусками бот мог дописать строку - подтягиваем перед пушем.
           git pull --rebase --autostash
           git push

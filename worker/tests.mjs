@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  formatLength,
   formatLocal,
   formatScore,
   formatUtc,
@@ -61,6 +62,19 @@ test("балл печатается без хвоста .0, пустой - пу�
   assert.equal(formatScore(3), "3");
   assert.equal(formatScore(3.5), "3.5");
   assert.equal(formatScore(null), "");
+});
+
+test("длина пробок пишется с дробной частью, как str(float) в Python", () => {
+  // В файле уже есть замеры вида 42527.0 - формат столбца не должен зависеть
+  // от того, кто снял балл: Actions или Worker.
+  assert.equal(formatLength(42527), "42527.0");
+  assert.equal(formatLength(24728.3), "24728.3");
+  assert.equal(formatLength(undefined), "");
+});
+
+test("источники сортируются по кодовым точкам, как в Python", () => {
+  const { rows } = upsert([], [row({ source: "yandex" }), row({ source: "2gis", score: "1" })]);
+  assert.deepEqual(rows.map((item) => item.source), ["2gis", "yandex"]);
 });
 
 test("разбор и сборка CSV не меняют файл", () => {

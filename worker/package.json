@@ -1,0 +1,9 @@
+{
+  "name": "forsite-traffic-worker",
+  "private": true,
+  "type": "module",
+  "description": "Сбор балла пробок на Cloudflare Workers. Нужен только чтобы node читал traffic-worker.js как модуль при запуске тестов: node --test worker/tests.mjs",
+  "scripts": {
+    "test": "node --test tests.mjs"
+  }
+}

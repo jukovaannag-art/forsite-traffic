@@ -1,0 +1,23 @@
+# Конфиг для деплоя воркера из терминала:
+#   npx wrangler login                 (один раз, откроет браузер)
+#   npx wrangler deploy -c worker/wrangler.toml
+#   npx wrangler secret put GITHUB_TOKEN -c worker/wrangler.toml
+#
+# Через веб-редактор Cloudflare тот же воркер ставится копипастом файла
+# traffic-worker.js - конфиг тогда не нужен, но крон придётся включить руками.
+
+name = "forsite-traffic"
+main = "traffic-worker.js"
+compatibility_date = "2026-08-28"
+
+# 23 UTC и 0-15 UTC = 7:00-23:00 по Иркутску (UTC+8 круглый год).
+# Три попытки в час: внутри часа засчитывается первая удачная, остальные
+# нужны на случай, когда источник не ответил, и файл они не трогают.
+[triggers]
+crons = ["*/20 23,0-15 * * *"]
+
+# Наблюдаемость: без неё журнал воркера пуст, и разбирать сбой не по чему.
+[observability]
+enabled = true
+
+# GITHUB_TOKEN сюда не пишется никогда - только `wrangler secret put`.

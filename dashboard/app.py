@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -16,6 +17,23 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent.parent
 # TRAFFIC_CSV позволяет открыть дашборд на другом файле (демо, проверка).
 DATA_PATH = Path(os.environ.get("TRAFFIC_CSV") or ROOT / "data" / "traffic_irkutsk.csv")
+
+# Данные берутся прямо с GitHub, а не из копии репозитория рядом с дашбордом:
+# Streamlit Cloud обновляет свою копию только при перезапуске приложения, и
+# свежие замеры появлялись на дашборде с опозданием в часы. Сеть недоступна -
+# откатываемся на локальный файл, чтобы дашборд работал и без интернета.
+#
+# Указан TRAFFIC_CSV - значит дашборд открыли на конкретном файле (демо,
+# проверка, тесты), и лезть за настоящими данными в сеть нельзя: показали бы
+# не то, что просили, да ещё и с непредсказуемой задержкой.
+DATA_URL = (
+    ""
+    if os.environ.get("TRAFFIC_CSV")
+    else os.environ.get(
+        "TRAFFIC_CSV_URL",
+        "https://raw.githubusercontent.com/jukovaannag-art/forsite-traffic/main/data/traffic_irkutsk.csv",
+    )
+)
 
 HOUR_FROM, HOUR_TO = 7, 23
 
@@ -35,12 +53,26 @@ INK_MUTED = "#6b6b66"
 st.set_page_config(page_title="Пробки Иркутска - Форсайт", page_icon="🚦", layout="wide")
 
 
-@st.cache_data(ttl=300)
-def load_data(path: Path) -> pd.DataFrame:
-    """Читает историю измерений. Строки без балла (сбой источника) отбрасываем."""
+def _read_source(path: Path, url: str) -> pd.DataFrame:
+    """Сначала GitHub, потом локальный файл. Пусто - вернём пустую таблицу."""
+    if url:
+        try:
+            # Метка времени обходит кэш CDN: без неё raw отдаёт версию до пяти
+            # минут давности. На ключ кэша Streamlit она не влияет - считается
+            # внутри функции, а не в аргументах.
+            fresh = f"{url}{'&' if '?' in url else '?'}t={int(time.time())}"
+            return pd.read_csv(fresh, dtype={"source": str})
+        except Exception:  # noqa: BLE001 - сеть, прокси, 404: причина не меняет действий
+            pass
     if not path.exists():
         return pd.DataFrame()
-    frame = pd.read_csv(path, dtype={"source": str})
+    return pd.read_csv(path, dtype={"source": str})
+
+
+@st.cache_data(ttl=120)
+def load_data(path: Path, url: str = DATA_URL) -> pd.DataFrame:
+    """Читает историю измерений. Строки без балла (сбой источника) отбрасываем."""
+    frame = _read_source(path, url)
     if frame.empty:
         return frame
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date

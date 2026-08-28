@@ -1,0 +1,46 @@
+name: Сторож сбора (письмо о статусе)
+
+on:
+  schedule:
+    # Иркутск = UTC+8. Три прогона в сутки, не чаще: у GitHub квота исполненных
+    # тиков общая на репозиторий, и сторож не должен объедать сам сбор.
+    #  3:00 UTC = 11:00 местного - утренняя проверка, окно уже час как открыто;
+    #  9:00 UTC = 17:00 местного - дневная, вечерний пик впереди;
+    # 15:30 UTC = 23:30 местного - окно закрылось, шлём сводку за день.
+    - cron: "0 3,9 * * *"
+    - cron: "30 15 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "alert - письмо только при проблеме, daily - письмо всегда"
+        type: choice
+        options: [alert, daily]
+        default: daily
+
+permissions:
+  contents: read # сторож ничего не пишет в репозиторий, только читает данные
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Проверить сбор и отправить письмо
+        env:
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          # Не заданы - берётся Яндекс (см. watch.py). Это переменные
+          # репозитория, а не секреты: адрес сервера прятать не от кого.
+          MAIL_HOST: ${{ vars.MAIL_HOST }}
+          MAIL_PORT: ${{ vars.MAIL_PORT }}
+          # Вечерний тик (15:30 UTC) шлёт сводку всегда, остальные - молчат,
+          # пока всё хорошо. Ручной запуск берёт режим из формы.
+          MODE: ${{ github.event.inputs.mode || (github.event.schedule == '30 15 * * *' && 'daily' || 'alert') }}
+        run: python watch.py --mode "$MODE"

@@ -9,8 +9,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  closedHours,
   formatLength,
   formatLocal,
+  hoursWord,
+  inspect,
+  lastMeasurement,
+  watchMessage,
   formatScore,
   formatUtc,
   isWindowOpen,
@@ -136,4 +141,92 @@ test("два источника за один час не считаются д�
   const { rows, added } = upsert([row({ source: "yandex" })], [row({ source: "2gis", score: "1" })]);
   assert.equal(added, 1);
   assert.equal(rows.length, 2);
+});
+
+/* ------------------------------- сторож ---------------------------------- */
+
+// Местное время как объект, у которого UTC-поля равны иркутским.
+const at = (hour, minute = 0) => toIrkutsk(new Date(Date.UTC(2026, 7, 28, hour - 8, minute, 0)));
+
+// Ряд за сегодня: часы с 7 до hourTo включительно, оба источника.
+function history(hourTo, overrides = {}) {
+  const rows = [];
+  for (let hour = 7; hour <= hourTo; hour += 1) {
+    for (const source of ["2gis", "yandex"]) {
+      rows.push(
+        row({
+          hour: String(hour),
+          source,
+          ts_local: `2026-08-28T${String(hour).padStart(2, "0")}:00:12`,
+          ...overrides,
+        }),
+      );
+    }
+  }
+  return rows;
+}
+
+test("склонение часов человеческое", () => {
+  assert.equal(hoursWord(1), "час");
+  assert.equal(hoursWord(3), "часа");
+  assert.equal(hoursWord(11), "часов");
+  assert.equal(hoursWord(21), "час");
+});
+
+test("последний замер берётся по удачным строкам, не по всем", () => {
+  const rows = [...history(9), row({ hour: "10", score: "", error: "network", ts_local: "2026-08-28T10:00:12" })];
+  assert.equal(formatLocal(new Date(lastMeasurement(rows))), "2026-08-28T09:00:12");
+});
+
+test("закрытые часы считают час один раз, даже если источников два", () => {
+  assert.equal(closedHours(history(10), "2026-08-28"), 4); // 7, 8, 9, 10
+});
+
+test("свежий сбор проблем не даёт", () => {
+  assert.equal(inspect(history(12), at(12, 30)).ok, true);
+});
+
+test("молчание дольше двух часов внутри окна - тревога", () => {
+  const health = inspect(history(9), at(13));
+  assert.equal(health.ok, false);
+  assert.match(health.problems[0], /сбор молчит 4\.0 ч/);
+});
+
+test("ночью молчание законно и тревоги не даёт", () => {
+  // 3:00 - окно закрыто, последний замер был днём: это норма, а не поломка.
+  assert.equal(inspect(history(9), at(3)).ok, true);
+});
+
+test("три неудачных часа у источника за сутки - тревога", () => {
+  const rows = [
+    ...history(12),
+    ...[13, 14, 15].map((hour) =>
+      row({ hour: String(hour), source: "2gis", score: "", error: "network: таймаут", ts_local: `2026-08-28T${hour}:00:12` }),
+    ),
+  ];
+  const health = inspect(rows, at(15, 30));
+  assert.ok(health.problems.some((p) => p.includes("2gis") && p.includes("3 неудачных часа")));
+});
+
+test("одиночный сбой источника тревогой не считается", () => {
+  const rows = [...history(12), row({ hour: "13", source: "2gis", score: "", error: "network", ts_local: "2026-08-28T13:00:12" })];
+  assert.equal(inspect(rows, at(13, 30)).ok, true);
+});
+
+test("тревога уходит раз в час, а не на каждом тике", () => {
+  const broken = history(9);
+  assert.ok(watchMessage(broken, at(13, 0)), "в начале часа пишем");
+  assert.equal(watchMessage(broken, at(13, 20)), null, "в середине часа молчим");
+  assert.equal(watchMessage(broken, at(13, 40)), null, "и в конце тоже");
+});
+
+test("вечером приходит сводка, даже когда всё хорошо", () => {
+  const message = watchMessage(history(23), at(23, 0));
+  assert.ok(message);
+  assert.match(message, /день закрыт/);
+  assert.match(message, /закрыто 17 часов из 17/);
+});
+
+test("когда всё хорошо и час не вечерний - не пишем вовсе", () => {
+  assert.equal(watchMessage(history(12), at(12, 0)), null);
 });

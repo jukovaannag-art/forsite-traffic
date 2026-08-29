@@ -222,9 +222,15 @@ test("тревога уходит раз в час, а не на каждом т
 
 test("вечером приходит сводка, даже когда всё хорошо", () => {
   const message = watchMessage(history(23), at(23, 0));
-  assert.ok(message);
-  assert.match(message, /день закрыт/);
-  assert.match(message, /закрыто 17 часов из 17/);
+  assert.equal(message.kind, "summary");
+  assert.match(message.text, /день закрыт/);
+  assert.match(message.text, /закрыто 17 часов из 17/);
+});
+
+test("поломка помечается тревогой - по ней и заводится issue", () => {
+  const message = watchMessage(history(9), at(13, 0));
+  assert.equal(message.kind, "alert");
+  assert.match(message.text, /сбор молчит/);
 });
 
 test("когда всё хорошо и час не вечерний - не пишем вовсе", () => {

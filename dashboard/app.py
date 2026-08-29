@@ -53,34 +53,40 @@ INK_MUTED = "#6b6b66"
 st.set_page_config(page_title="Пробки Иркутска - Форсайт", page_icon="🚦", layout="wide")
 
 
-def _read_source(path: Path, url: str) -> pd.DataFrame:
-    """Сначала GitHub, потом локальный файл. Пусто - вернём пустую таблицу."""
+def _read_source(path: Path, url: str) -> tuple[pd.DataFrame, str]:
+    """Сначала GitHub, потом локальный файл.
+
+    Возвращает и происхождение данных: откат на локальную копию должен быть
+    виден. Сеть до GitHub рвётся, копия рядом с дашбордом отстаёт на сутки, и
+    молчаливая подмена выглядит как «сбор встал», хотя он идёт.
+    """
     if url:
-        try:
-            # Метка времени обходит кэш CDN: без неё raw отдаёт версию до пяти
-            # минут давности. На ключ кэша Streamlit она не влияет - считается
-            # внутри функции, а не в аргументах.
-            fresh = f"{url}{'&' if '?' in url else '?'}t={int(time.time())}"
-            return pd.read_csv(fresh, dtype={"source": str})
-        except Exception:  # noqa: BLE001 - сеть, прокси, 404: причина не меняет действий
-            pass
+        for _ in range(3):
+            try:
+                # Метка времени обходит кэш CDN: без неё raw отдаёт версию до
+                # пяти минут давности. На ключ кэша Streamlit она не влияет -
+                # считается внутри функции, а не в аргументах.
+                fresh = f"{url}{'&' if '?' in url else '?'}t={int(time.time())}"
+                return pd.read_csv(fresh, dtype={"source": str}), "github"
+            except Exception:  # noqa: BLE001 - сеть, прокси, 404: причина не меняет действий
+                time.sleep(1)
     if not path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(path, dtype={"source": str})
+        return pd.DataFrame(), "пусто"
+    return pd.read_csv(path, dtype={"source": str}), "локальная копия"
 
 
 @st.cache_data(ttl=120)
-def load_data(path: Path, url: str = DATA_URL) -> pd.DataFrame:
+def load_data(path: Path, url: str = DATA_URL) -> tuple[pd.DataFrame, str]:
     """Читает историю измерений. Строки без балла (сбой источника) отбрасываем."""
-    frame = _read_source(path, url)
+    frame, origin = _read_source(path, url)
     if frame.empty:
-        return frame
+        return frame, origin
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date
     frame["hour"] = pd.to_numeric(frame["hour"], errors="coerce")
     frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
     frame = frame.dropna(subset=["date", "hour", "score"])
     frame["hour"] = frame["hour"].astype(int)
-    return frame
+    return frame, origin
 
 
 def daily_average(frame: pd.DataFrame) -> pd.DataFrame:
@@ -217,13 +223,19 @@ def main() -> None:
         "Источники считают по своим методикам - смотреть их рядом, а не смешивать."
     )
 
-    frame = load_data(DATA_PATH)
+    frame, origin = load_data(DATA_PATH)
     if frame.empty:
         st.warning(
             f"Данных пока нет. Файл `{DATA_PATH}` пуст или отсутствует. "
             "Запустите `python collect.py`."
         )
         return
+    if origin == "локальная копия" and DATA_URL:
+        # Молчать тут нельзя: устаревшая копия выглядит как остановившийся сбор.
+        st.warning(
+            "Не удалось получить свежие данные с GitHub - показана копия рядом с "
+            "дашбордом, она может отставать. Обновите страницу через минуту."
+        )
 
     # --- фильтры одной строкой над графиками ---
     first_date, last_date = min(frame["date"]), max(frame["date"])

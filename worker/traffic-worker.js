@@ -542,9 +542,49 @@ async function sendTelegram(env, text) {
       }),
       signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
     });
-    return response.ok ? "отправлено" : `Telegram отдал ${response.status}`;
+    if (response.ok) return "отправлено";
+    // Текст ошибки Telegram - это диагноз («chat not found», «unauthorized»),
+    // и токена в нём нет. Без него причина неотправки невидима.
+    const detail = (await response.text()).slice(0, 200);
+    return `Telegram отдал ${response.status}: ${detail}`;
   } catch (error) {
     return `не отправилось: ${error}`;
+  }
+}
+
+/**
+ * Заводит issue в репозитории. GitHub сам шлёт письмо на почту владельца -
+ * доставка без единого нового сервиса, пароля и бота.
+ *
+ * Открытых issue про поломку держим не больше одной: пока прошлая не закрыта,
+ * новых не заводим, иначе за день отказа набралось бы полтора десятка писем.
+ * Закрывает их человек - это и есть отметка «увидел». Токену закрывать нельзя,
+ * и метки ставить тоже: проверено, GitHub отвечает 403. Поэтому свою issue
+ * сторож узнаёт по заголовку.
+ */
+async function openIssue(env, title, body) {
+  const repo = env.GITHUB_REPO || DEFAULT_REPO;
+  const headers = githubHeaders(env);
+  try {
+    const existing = await fetch(
+      `https://api.github.com/repos/${repo}/issues?state=open&per_page=50&t=${Date.now()}`,
+      { headers, cache: "no-store" },
+    );
+    if (existing.ok) {
+      const items = await existing.json();
+      const same = Array.isArray(items) && items.find((item) => item.title === title);
+      if (same) return `уже открыт #${same.number}, второй не заводим`;
+    }
+    const created = await fetch(`https://api.github.com/repos/${repo}/issues`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ title, body }),
+    });
+    if (!created.ok) return `GitHub отдал ${created.status} на создание issue`;
+    const issue = await created.json();
+    return `заведён #${issue.number}`;
+  } catch (error) {
+    return `не получилось: ${error}`;
   }
 }
 
@@ -560,12 +600,18 @@ function watchMessage(rows, local) {
   const isSummaryHour = local.getUTCHours() === WINDOW_END_HOUR;
   const isTopOfHour = local.getUTCMinutes() < 20;
 
+  const problems = health.problems.map((p) => `- ${p}`);
+  const notes = health.notes.map((n) => `- ${n}`);
+
   if (isSummaryHour && isTopOfHour) {
     const head = health.ok ? "Пробки Иркутска: день закрыт" : "Пробки Иркутска: день закрыт с проблемами";
-    return [head, "", ...health.problems.map((p) => `- ${p}`), ...(health.problems.length ? [""] : []), ...health.notes.map((n) => `- ${n}`), "", DASHBOARD_URL].join("\n");
+    const text = [head, "", ...problems, ...(problems.length ? [""] : []), ...notes, "", DASHBOARD_URL].join("\n");
+    return { kind: "summary", title: head, text };
   }
   if (!health.ok && isTopOfHour) {
-    return ["Пробки Иркутска: похоже, сбор сломался", "", ...health.problems.map((p) => `- ${p}`), "", ...health.notes.map((n) => `- ${n}`), "", DASHBOARD_URL].join("\n");
+    const head = "Пробки Иркутска: похоже, сбор сломался";
+    const text = [head, "", ...problems, "", ...notes, "", DASHBOARD_URL].join("\n");
+    return { kind: "alert", title: head, text };
   }
   return null;
 }
@@ -637,7 +683,15 @@ export default {
     // GitHub не делаем. Ночью (окно закрыто) истории нет и проверять нечего.
     if (report.history) {
       const message = watchMessage(report.history, toIrkutsk(now));
-      if (message) report.telegram = await sendTelegram(env, message);
+      if (message) {
+        // Телеграм - если настроен. Issue - только на тревогу: письмо о том,
+        // что всё хорошо, каждый вечер превратилось бы в шум, который перестают
+        // читать. Сводку смотреть на дашборде.
+        report.telegram = await sendTelegram(env, message.text);
+        if (message.kind === "alert") {
+          report.issue = await openIssue(env, message.title, message.text);
+        }
+      }
       delete report.history; // в журнал уходит отчёт, а не весь ряд
     }
 
@@ -658,6 +712,19 @@ export default {
       // единственная причина, по которой свежепоставленный воркер молчит.
       if (!env.GITHUB_TOKEN) {
         return json({ error: "воркеру не задан секрет GITHUB_TOKEN" }, 500);
+      }
+      // Проверка связи с Telegram по требованию. Пускаем того, кто знает
+      // chat_id: знание адреса своего же чата - достаточное право отправить
+      // туда сообщение, а заспамить чужой чат так нельзя.
+      if (url.pathname === "/ping") {
+        if (!env.TELEGRAM_TOKEN || !env.TELEGRAM_CHAT_ID) {
+          return json({ error: "не заданы TELEGRAM_TOKEN или TELEGRAM_CHAT_ID" }, 500);
+        }
+        if (url.searchParams.get("chat") !== String(env.TELEGRAM_CHAT_ID)) {
+          return json({ error: "chat не совпадает с настроенным" }, 403);
+        }
+        const result = await sendTelegram(env, "Проверка связи: сторож пробок на месте.");
+        return json({ telegram: result });
       }
       if (url.pathname === "/collect") {
         // Ручной прогон закрыт ключом: иначе любой прохожий пишет в репозиторий.

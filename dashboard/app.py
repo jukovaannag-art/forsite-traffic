@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -15,6 +16,13 @@ import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent.parent
+# streamlit run кладёт в sys.path папку скрипта, а не корень репозитория -
+# без этой строки не находятся ни collector, ни соседний модуль заметок.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from collector import weather as weather_source  # noqa: E402
+from dashboard import notes as notes_store  # noqa: E402
 # TRAFFIC_CSV позволяет открыть дашборд на другом файле (демо, проверка).
 DATA_PATH = Path(os.environ.get("TRAFFIC_CSV") or ROOT / "data" / "traffic_irkutsk.csv")
 
@@ -32,6 +40,16 @@ DATA_URL = (
     else os.environ.get(
         "TRAFFIC_CSV_URL",
         "https://raw.githubusercontent.com/jukovaannag-art/forsite-traffic/main/data/traffic_irkutsk.csv",
+    )
+)
+
+NOTES_PATH = ROOT / "data" / "day_notes.csv"
+NOTES_URL = (
+    ""
+    if os.environ.get("TRAFFIC_CSV")
+    else os.environ.get(
+        "DAY_NOTES_URL",
+        "https://raw.githubusercontent.com/jukovaannag-art/forsite-traffic/main/data/day_notes.csv",
     )
 )
 
@@ -87,6 +105,48 @@ def load_data(path: Path, url: str = DATA_URL) -> tuple[pd.DataFrame, str]:
     frame = frame.dropna(subset=["date", "hour", "score"])
     frame["hour"] = frame["hour"].astype(int)
     return frame, origin
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_weather(start: date, end: date) -> dict[date, str]:
+    """Строка погоды на каждый день периода. Сеть недоступна - пустой словарь.
+
+    Час кэша: погода прошедших суток уже не изменится, а текущие сутки
+    уточняются медленно. Ключ кэша - границы периода, поэтому переключение
+    фильтра не тянет источник заново.
+    """
+    return {
+        day: item.summary()
+        for day, item in weather_source.fetch_daily(start, end).items()
+        if item.summary()
+    }
+
+
+def notes_storage() -> notes_store.Storage:
+    """Токен на запись живёт в секретах Streamlit, рядом с кодом его нет.
+
+    Секретов может не быть вовсе (локальный запуск) - тогда st.secrets бросает
+    исключение уже на обращении к ключу, и это нормальный режим, а не сбой.
+    """
+    token = ""
+    try:
+        token = str(st.secrets.get("GITHUB_TOKEN", ""))
+    except Exception:  # noqa: BLE001 - файла секретов нет: работаем локально
+        token = ""
+    return notes_store.Storage(path=NOTES_PATH, token=token or os.environ.get("GITHUB_TOKEN", ""))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_notes(url: str = NOTES_URL) -> dict[date, str]:
+    return notes_store.load(notes_storage(), url)
+
+
+def day_context(
+    day: date, weather: dict[date, str], notes: dict[date, str]
+) -> str:
+    """Погода и заметка одной строкой - для подсказки на графике и таблицы."""
+    parts = [weather.get(day, ""), notes.get(day, "")]
+    return " · ".join(part for part in parts if part)
 
 
 def daily_average(frame: pd.DataFrame) -> pd.DataFrame:
@@ -158,7 +218,37 @@ def style_axes(figure: go.Figure, y_title: str = "Балл пробок") -> go.
     return figure
 
 
-def line_by_source(frame: pd.DataFrame, x_field: str, x_title: str) -> go.Figure:
+def add_day_context(figure: go.Figure, days: list[date], context: dict[date, str]) -> None:
+    """Добавляет строку контекста в общую подсказку дня.
+
+    Подсказка на графике объединена по X, поэтому контекст несёт отдельный
+    невидимый след: иначе погода и заметка повторились бы в каждой строке
+    подсказки - по разу на источник.
+    """
+    labels = [context.get(day, "") for day in days]
+    if not any(labels):
+        return
+    figure.add_trace(
+        go.Scatter(
+            x=days,
+            # Дни без контекста получают None: точки нет - и пустой строки в
+            # подсказке тоже нет.
+            y=[0 if label else None for label in labels],
+            mode="markers",
+            marker=dict(size=0.1, color="rgba(0,0,0,0)"),
+            customdata=labels,
+            showlegend=False,
+            hovertemplate="%{customdata}<extra></extra>",
+        )
+    )
+
+
+def line_by_source(
+    frame: pd.DataFrame,
+    x_field: str,
+    x_title: str,
+    context: dict[date, str] | None = None,
+) -> go.Figure:
     figure = go.Figure()
     for source, part in frame.groupby("source"):
         part = part.sort_values(x_field)
@@ -173,6 +263,8 @@ def line_by_source(frame: pd.DataFrame, x_field: str, x_title: str) -> go.Figure
                 hovertemplate="%{y:.2f} балла<extra>%{fullData.name}</extra>",
             )
         )
+    if x_field == "date" and context:
+        add_day_context(figure, sorted(frame["date"].unique()), context)
     figure = style_axes(figure)
     figure.update_xaxes(title_text=x_title)
     figure.update_yaxes(range=[0, 10])
@@ -213,6 +305,66 @@ def heatmap(frame: pd.DataFrame, source: str) -> go.Figure:
         font=dict(size=13),
     )
     return figure
+
+
+def note_editor(
+    days: list[date],
+    default_day: date,
+    weather: dict[date, str],
+    notes: dict[date, str],
+) -> None:
+    """Погоду показываем, заметку даём написать - рядом, про один и тот же день."""
+    if not days:
+        return
+    # Свежий день сверху и выбран по умолчанию: чаще всего комментируют вчера.
+    ordered = sorted(days, reverse=True)
+    columns = st.columns([1, 3])
+    with columns[0]:
+        day = st.selectbox(
+            "День",
+            ordered,
+            index=ordered.index(default_day) if default_day in ordered else 0,
+            format_func=lambda d: f"{d:%d.%m.%Y}",
+        )
+    with columns[1]:
+        st.text_input(
+            "Погода (тянется автоматически)",
+            value=weather.get(day, "источник погоды недоступен"),
+            disabled=True,
+        )
+
+    storage = notes_storage()
+    with st.form(f"note-{day}"):
+        text = st.text_area(
+            "Заметка: перекрытия, ремонт, праздник, крупное ДТП",
+            value=notes.get(day, ""),
+            max_chars=notes_store.MAX_NOTE_LEN,
+            height=90,
+            placeholder="Например: перекрыт Глазковский мост, ремонт до 12.09",
+        )
+        saved = st.form_submit_button("Сохранить", type="primary")
+
+    if not storage.writes_to_github:
+        st.caption(
+            "Токен GitHub не задан - заметка сохранится в файл рядом с "
+            "дашбордом. В облаке такой файл живёт только до перезапуска."
+        )
+    st.caption(
+        "Файл заметок лежит в публичном репозитории: без фамилий, номеров машин "
+        "и телефонов."
+    )
+
+    if saved:
+        try:
+            where = notes_store.save(storage, day, text)
+        except Exception as error:  # noqa: BLE001 - показываем причину, не роняем дашборд
+            st.error(f"Не сохранилось: {error}")
+            return
+        # Кэш заметок держится минуту - без сброса своя же правка вернулась бы
+        # на экран старой версией.
+        load_notes.clear()
+        st.success(f"Сохранено ({where}).")
+        st.rerun()
 
 
 def main() -> None:
@@ -283,12 +435,20 @@ def main() -> None:
         )
         return
 
+    # --- контекст дня: погода тянется сама, заметки пишет человек ---
+    period_first, period_last = min(period["date"]), max(period["date"])
+    weather = load_weather(period_first, period_last)
+    notes = load_notes()
+    context = {
+        day: day_context(day, weather, notes)
+        for day in sorted(period["date"].unique())
+    }
+
     # --- KPI ---
     daily = daily_average(period)
     latest_ts = period["ts_local"].max()
     # Последний день считается внутри периода: при своих датах последний замер
     # всей истории может лежать далеко за правой границей.
-    period_first, period_last = min(period["date"]), max(period["date"])
     tiles = st.columns(len(chosen) + 2)
     for column, source in zip(tiles, chosen):
         source_rows = period[period["source"] == source].sort_values("ts_local")
@@ -318,12 +478,17 @@ def main() -> None:
         ),
     )
 
+    if context.get(period_last):
+        st.caption(f"{period_last:%d.%m}: {context[period_last]}")
+
     st.divider()
 
     left, right = st.columns(2)
     with left:
         st.subheader("Средний балл по дням")
-        st.plotly_chart(line_by_source(daily, "date", "Дата"), width="stretch")
+        st.plotly_chart(
+            line_by_source(daily, "date", "Дата", context=context), width="stretch"
+        )
     with right:
         st.subheader("Профиль по часам")
         hourly = (
@@ -341,9 +506,15 @@ def main() -> None:
     )
     st.plotly_chart(heatmap(period, heat_source), width="stretch")
 
+    st.subheader("Что было в этот день")
+    note_editor(sorted(period["date"].unique()), period_last, weather, notes)
+
     with st.expander("Таблица: средние по дням"):
         table = daily.pivot(index="date", columns="source", values="score")
         table.columns = [SOURCE_TITLES.get(c, c) for c in table.columns]
+        # Контекст идёт последними колонками: сначала цифра, потом объяснение.
+        table["Погода"] = [weather.get(day, "") for day in table.index]
+        table["Заметка"] = [notes.get(day, "") for day in table.index]
         table.index.name = "Дата"
         st.dataframe(table.sort_index(ascending=False), width="stretch")
         st.download_button(

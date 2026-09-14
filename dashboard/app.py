@@ -54,9 +54,12 @@ NOTES_URL = (
 )
 
 HOUR_FROM, HOUR_TO = 7, 23
+# Сколько замеров даёт полностью собранный день.
+FULL_DAY_HOURS = HOUR_TO - HOUR_FROM + 1
 
+WEEK = "Неделя"
 # Готовые периоды и сколько дней они берут, считая последний день с данными.
-PERIOD_DAYS = {"Неделя": 7, "2 недели": 14, "Месяц": 30}
+PERIOD_DAYS = {WEEK: 7, "2 недели": 14, "Месяц": 30}
 ALL_TIME = "Всё время"
 CUSTOM = "Свой период"
 
@@ -169,6 +172,70 @@ def preset_range(frame: pd.DataFrame, label: str) -> tuple[date, date]:
     if days is None:
         return first, last
     return max(first, last - timedelta(days=days - 1)), last
+
+
+def complete_days(frame: pd.DataFrame, sources: list[str]) -> list[date]:
+    """Дни, где каждый выбранный источник дал все 17 часов окна 7:00-23:00.
+
+    Дашборд показывает только такие дни: текущие сутки собраны наполовину, и
+    их среднее ниже настоящего - вечерний пик ещё не случился. Сравнивать
+    неполный день с полным нельзя, а период с периодом - тем более.
+    """
+    inside = frame[frame["hour"].between(HOUR_FROM, HOUR_TO)]
+    if inside.empty or not sources:
+        return []
+    counts = (
+        inside.groupby(["date", "source"])["hour"]
+        .nunique()
+        .unstack(fill_value=0)
+        # Источник, которого нет в данных вовсе, колонки не создаст - без
+        # reindex он молча выпал бы из проверки, и день считался бы полным.
+        .reindex(columns=list(sources), fill_value=0)
+    )
+    full = counts.min(axis=1) >= FULL_DAY_HOURS
+    return sorted(day for day, ok in full.items() if ok)
+
+
+def period_windows(
+    days: list[date], label: str, start: date, end: date
+) -> tuple[list[date], list[date]]:
+    """Полные дни выбранного периода и предыдущего периода той же длины.
+
+    Готовые периоды считаются в полных днях подряд: «Неделя» - последние 7
+    полных дней, предыдущая неделя - 7 полных дней до них. Календарные
+    понедельник-воскресенье не берём: сбор идёт не с понедельника, и «неделя»
+    в дашборде всегда значила последние 7 дней с данными.
+
+    У своего периода длина календарная, как выбрал человек: предыдущее окно -
+    столько же суток вплотную перед началом. Считать его в полных днях нельзя -
+    дыра в сборе увела бы сравнение на произвольную глубину назад.
+    """
+    size = PERIOD_DAYS.get(label)
+    if size:
+        return days[-size:], days[-2 * size : -size]
+    if label == ALL_TIME:
+        # Вся история уже показана целиком - предыдущего периода не существует.
+        return days, []
+    if start > end:
+        start, end = end, start
+    length = (end - start).days + 1
+    before = start - timedelta(days=length)
+    return (
+        [day for day in days if start <= day <= end],
+        [day for day in days if before <= day < start],
+    )
+
+
+def window_average(frame: pd.DataFrame, days: list[date]) -> pd.Series:
+    """Средний балл за набор дней по каждому источнику.
+
+    По источникам раздельно: методики Яндекса и 2ГИС разные, общее среднее
+    двух шкал не значит ничего.
+    """
+    if not days:
+        return pd.Series(dtype=float)
+    part = frame[frame["date"].isin(days) & frame["hour"].between(HOUR_FROM, HOUR_TO)]
+    return part.groupby("source")["score"].mean()
 
 
 def slice_period(frame: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
@@ -367,6 +434,73 @@ def note_editor(
         st.rerun()
 
 
+def plural_days(count: int) -> str:
+    """«1 день», «2 дня», «7 дней» - число всегда на виду, без «дн.»."""
+    tail = count % 100
+    if 11 <= tail <= 14:
+        return f"{count} дней"
+    tail = count % 10
+    if tail == 1:
+        return f"{count} день"
+    if 2 <= tail <= 4:
+        return f"{count} дня"
+    return f"{count} дней"
+
+
+def span(days: list[date]) -> str:
+    return f"{days[0]:%d.%m} - {days[-1]:%d.%m}"
+
+
+def period_totals(
+    frame: pd.DataFrame,
+    current: list[date],
+    previous: list[date],
+    sources: list[str],
+) -> None:
+    """Среднее за период по источникам и разница с предыдущим таким же периодом."""
+    st.subheader("Итог периода")
+    now = window_average(frame, current)
+    # Огрызок предыдущего периода в сравнение не идёт: цифра дельты читается
+    # как равное сравнение и спорит с подписью под ней. Половина - граница
+    # произвольная, но два дня против четырнадцати она отсекает.
+    comparable = len(previous) * 2 >= len(current)
+    before = window_average(frame, previous if comparable else [])
+    for column, source in zip(st.columns(len(sources)), sources):
+        value = now.get(source, float("nan"))
+        past = before.get(source, float("nan"))
+        column.metric(
+            SOURCE_TITLES.get(source, source),
+            "-" if pd.isna(value) else f"{value:.2f}",
+            delta=(
+                None
+                if pd.isna(value) or pd.isna(past)
+                else f"{value - past:+.2f} к прошлому периоду"
+            ),
+            # Рост балла - это ухудшение, зелёным его красить нельзя.
+            delta_color="inverse",
+        )
+
+    st.caption(
+        f"Период {span(current)}: {plural_days(len(current))} с полным сбором "
+        "по 17 часов. Незаконченные сутки в средние не входят."
+    )
+    if not previous:
+        st.caption("Предыдущего периода в данных нет - сравнивать не с чем.")
+    elif not comparable:
+        st.caption(
+            f"Предыдущий период собран слишком неполно: полных дней всего "
+            f"{len(previous)} против {len(current)} - сравнение не показываем."
+        )
+    elif len(previous) < len(current):
+        # Молчать нельзя: сравнение семи дней с пятью выглядит как равное.
+        st.caption(
+            f"Предыдущий период {span(previous)} собран не целиком: полных дней "
+            f"{len(previous)} против {len(current)}, сравнение идёт по ним."
+        )
+    else:
+        st.caption(f"Предыдущий период: {span(previous)}.")
+
+
 def main() -> None:
     st.title("🚦 Пробки Иркутска")
     st.caption(
@@ -410,7 +544,7 @@ def main() -> None:
         with filters[2]:
             picked = st.date_input(
                 "С какого по какое",
-                value=preset_range(frame, "Неделя"),
+                value=preset_range(frame, WEEK),
                 min_value=first_date,
                 max_value=last_date,
                 format="DD.MM.YYYY",
@@ -421,8 +555,22 @@ def main() -> None:
         start = picked[0]
         end = picked[1] if len(picked) > 1 else last_date
 
+    # Любой период - это только полностью собранные сутки: сегодняшний неполный
+    # день и дни с дырами в сборе из него выпадают.
+    current_days, prev_days = (
+        period_windows(complete_days(frame, chosen), period_label, start, end)
+        if chosen
+        else ([], [])
+    )
+    if current_days:
+        start, end = current_days[0], current_days[-1]
+
     period = slice_period(frame, start, end)
     period = period[period["source"].isin(chosen)] if chosen else period.iloc[0:0]
+    if current_days:
+        # Неполный день посреди периода (сбор падал) выбрасываем целиком: иначе
+        # он занижает и дневной график, и среднее за период.
+        period = period[period["date"].isin(current_days)]
     # Замеры вне 7:00-23:00 - это опоздавшие запуски сборщика, сползшие за
     # полночь. В средние и в полноту они не идут, но и не пропадают: счётчик
     # под таблицей показывает, сколько их.
@@ -434,6 +582,12 @@ def main() -> None:
             "по выбранным источникам данных нет."
         )
         return
+
+    if not current_days:
+        st.caption(
+            "В этом периоде нет ни одних полностью собранных суток (17 часов "
+            "подряд) - показано всё как есть, включая незаконченные дни."
+        )
 
     # --- контекст дня: погода тянется сама, заметки пишет человек ---
     period_first, period_last = min(period["date"]), max(period["date"])
@@ -495,6 +649,9 @@ def main() -> None:
             period.groupby(["hour", "source"], as_index=False)["score"].mean().round(2)
         )
         st.plotly_chart(line_by_source(hourly, "hour", "Час"), width="stretch")
+
+    if current_days:
+        period_totals(frame, current_days, prev_days, chosen)
 
     st.subheader("День и час: где скапливаются пробки")
     heat_source = st.radio(

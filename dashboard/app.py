@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -57,9 +57,16 @@ HOUR_FROM, HOUR_TO = 7, 23
 # Сколько замеров даёт полностью собранный день.
 FULL_DAY_HOURS = HOUR_TO - HOUR_FROM + 1
 
-WEEK = "Неделя"
-# Готовые периоды и сколько дней они берут, считая последний день с данными.
-PERIOD_DAYS = {WEEK: 7, "2 недели": 14, "Месяц": 30}
+# Сутки замеров идут по Иркутску, а дашборд крутится на сервере в UTC. Без
+# этого пояса «сегодня» в облаке с 16:00 до полуночи по Иркутску - уже завтра.
+# Смещение фиксированное: перевода часов в России нет.
+IRKUTSK_TZ = timezone(timedelta(hours=8), name="Asia/Irkutsk")
+
+WEEK, TWO_WEEKS, MONTH = "Неделя", "2 недели", "Месяц"
+# Готовые периоды - календарные и закрытые: неделя понедельник-воскресенье,
+# месяц с первого по последнее число. Считается последний закрытый период:
+# текущая неделя ещё идёт, и её три дня против семи прошлых - не сравнение.
+CALENDAR_PERIODS = (WEEK, TWO_WEEKS, MONTH)
 ALL_TIME = "Всё время"
 CUSTOM = "Свой период"
 
@@ -161,17 +168,69 @@ def daily_average(frame: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def preset_range(frame: pd.DataFrame, label: str) -> tuple[date, date]:
-    """Границы готового периода: последние N дней, считая от последнего замера.
+def week_start(day: date) -> date:
+    """Понедельник недели, в которую попал день."""
+    return day - timedelta(days=day.weekday())
 
-    Отсчёт идёт от данных, а не от сегодня: если сбор остановился, дашборд
-    покажет последнюю живую неделю, а не пустой экран.
+
+def month_start(day: date) -> date:
+    return day.replace(day=1)
+
+
+def closed_window(label: str, today: date, step: int = 0) -> tuple[date, date]:
+    """Границы закрытого календарного периода: step=0 - последний, 1 - до него.
+
+    Текущий период не берётся ни при каком step: он ещё идёт. Сравнивать
+    вторник с прошлой полной неделей - это сравнивать два дня с семью.
     """
+    if label == MONTH:
+        end = month_start(today) - timedelta(days=1)
+        for _ in range(step):
+            end = month_start(end) - timedelta(days=1)
+        return month_start(end), end
+    weeks = 2 if label == TWO_WEEKS else 1
+    # Воскресенье перед текущей неделей - правый край последнего закрытого окна.
+    end = week_start(today) - timedelta(days=7 * weeks * step + 1)
+    return end - timedelta(days=7 * weeks - 1), end
+
+
+def open_window(label: str, today: date) -> tuple[date, date]:
+    """Текущий, ещё не закрывшийся период: с его начала по сегодня.
+
+    Для «2 недель» это текущая неделя, а не две: хвост показывает, что идёт
+    прямо сейчас, и растягивать его на две недели вперёд нечем.
+    """
+    start = month_start(today) if label == MONTH else week_start(today)
+    return start, today
+
+
+def preset_window(
+    label: str, complete: list[date], today: date
+) -> tuple[tuple[date, date], tuple[date, date]]:
+    """Расчётное окно и предыдущее такое же. Пустое окно - шаг назад по календарю.
+
+    Шаг назад нужен, если сбор стоял: пустой экран вместо последней живой
+    недели читается как поломка дашборда, а не как дыра в данных.
+    """
+    earliest = min(complete) if complete else today
+    step = 0
+    while True:
+        start, end = closed_window(label, today, step)
+        if end < earliest or any(start <= day <= end for day in complete):
+            break
+        step += 1
+    return closed_window(label, today, step), closed_window(label, today, step + 1)
+
+
+def preset_range(frame: pd.DataFrame, label: str, today: date) -> tuple[date, date]:
+    """Границы, которые запрашивает фильтр, до отбора по полным суткам."""
     first, last = min(frame["date"]), max(frame["date"])
-    days = PERIOD_DAYS.get(label)
-    if days is None:
+    if label not in CALENDAR_PERIODS:
         return first, last
-    return max(first, last - timedelta(days=days - 1)), last
+    start, _ = closed_window(label, today)
+    # Правая граница - конец истории, а не конец закрытого окна: дни текущего
+    # периода показываются сверх расчётного.
+    return max(first, start), last
 
 
 def complete_days(frame: pd.DataFrame, sources: list[str]) -> list[date]:
@@ -196,23 +255,63 @@ def complete_days(frame: pd.DataFrame, sources: list[str]) -> list[date]:
     return sorted(day for day, ok in full.items() if ok)
 
 
-def period_windows(
-    days: list[date], label: str, start: date, end: date
-) -> tuple[list[date], list[date]]:
-    """Полные дни выбранного периода и предыдущего периода той же длины.
+def today_irkutsk() -> date:
+    return datetime.now(IRKUTSK_TZ).date()
 
-    Готовые периоды считаются в полных днях подряд: «Неделя» - последние 7
-    полных дней, предыдущая неделя - 7 полных дней до них. Календарные
-    понедельник-воскресенье не берём: сбор идёт не с понедельника, и «неделя»
-    в дашборде всегда значила последние 7 дней с данными.
+
+def collected_hours(frame: pd.DataFrame, day: date, sources: list[str]) -> int:
+    """Сколько часов окна 7:00-23:00 собрано за день - по худшему источнику.
+
+    По худшему, а не в среднем: день считается собранным настолько, насколько
+    собран самый отстающий из выбранных источников.
+    """
+    inside = frame[(frame["date"] == day) & frame["hour"].between(HOUR_FROM, HOUR_TO)]
+    if inside.empty or not sources:
+        return 0
+    counts = inside.groupby("source")["hour"].nunique()
+    return int(min(int(counts.get(source, 0)) for source in sources))
+
+
+def running_day(
+    frame: pd.DataFrame, complete: list[date], sources: list[str], today: date
+) -> date | None:
+    """Текущие сутки: сегодняшний день, если он собран ещё не целиком.
+
+    Нужен на графиках отдельно от полных суток. Без него дашборд в полдень
+    показывает картину позавчерашнего дня и выглядит остановившимся, а с ним
+    в средних - занижает период: вечерний пик сегодня ещё не случился.
+    Поэтому день видно, но все средние и сравнения идут мимо него.
+
+    Проверка именно на «сегодня», а не на «последний день в данных»: если сбор
+    упал позавчера, незаконченный позавчерашний день - это поломка, а не
+    идущие сутки, и подписывать его «день идёт» нельзя.
+    """
+    if frame.empty or not sources or today in complete:
+        return None
+    if today not in set(frame["date"]):
+        return None
+    return today if collected_hours(frame, today, sources) else None
+
+
+def period_windows(
+    days: list[date], label: str, start: date, end: date, today: date
+) -> tuple[list[date], list[date]]:
+    """Полные дни расчётного периода и предыдущего периода той же длины.
+
+    Готовые периоды - календарные и закрытые: «Неделя» это последняя закрытая
+    неделя понедельник-воскресенье, сравнение - неделя перед ней. Дни текущей,
+    ещё не закрывшейся недели сюда не попадают: их показывают отдельно.
 
     У своего периода длина календарная, как выбрал человек: предыдущее окно -
     столько же суток вплотную перед началом. Считать его в полных днях нельзя -
     дыра в сборе увела бы сравнение на произвольную глубину назад.
     """
-    size = PERIOD_DAYS.get(label)
-    if size:
-        return days[-size:], days[-2 * size : -size]
+    if label in CALENDAR_PERIODS:
+        (now_from, now_to), (was_from, was_to) = preset_window(label, days, today)
+        return (
+            [day for day in days if now_from <= day <= now_to],
+            [day for day in days if was_from <= day <= was_to],
+        )
     if label == ALL_TIME:
         # Вся история уже показана целиком - предыдущего периода не существует.
         return days, []
@@ -315,23 +414,56 @@ def line_by_source(
     x_field: str,
     x_title: str,
     context: dict[date, str] | None = None,
+    partial: date | None = None,
+    open_from: date | None = None,
+    open_title: str = "",
 ) -> go.Figure:
     figure = go.Figure()
     for source, part in frame.groupby("source"):
         part = part.sort_values(x_field)
+        colour = SOURCE_COLORS.get(source, "#888")
+        marker = dict(size=8, color=colour)
+        if x_field == "date" and partial is not None:
+            # Полая точка на незаконченных сутках: цифра за день ещё вырастет,
+            # и она не равноправна с полными днями рядом.
+            marker = dict(
+                size=9,
+                color=colour,
+                symbol=[
+                    "circle-open" if day == partial else "circle" for day in part[x_field]
+                ],
+                line=dict(width=2, color=colour),
+            )
         figure.add_trace(
             go.Scatter(
                 x=part[x_field],
                 y=part["score"],
                 name=SOURCE_TITLES.get(source, source),
                 mode="lines+markers",
-                line=dict(color=SOURCE_COLORS.get(source, "#888"), width=2),
-                marker=dict(size=8),
+                line=dict(color=colour, width=2),
+                marker=marker,
                 hovertemplate="%{y:.2f} балла<extra>%{fullData.name}</extra>",
             )
         )
     if x_field == "date" and context:
         add_day_context(figure, sorted(frame["date"].unique()), context)
+    if x_field == "date" and open_from is not None and not frame.empty:
+        # Дни текущего периода закрашены отдельным полем: они видны на графике,
+        # но в расчёт не идут, и без границы читались бы как часть периода.
+        # Половина суток по краям - чтобы заливка легла между точками, а не по
+        # их центрам.
+        figure.add_vrect(
+            x0=datetime.combine(open_from, datetime.min.time()) - timedelta(hours=12),
+            x1=datetime.combine(max(frame["date"]), datetime.min.time())
+            + timedelta(hours=12),
+            fillcolor="#f2c94c",
+            opacity=0.12,
+            line_width=0,
+            layer="below",
+            annotation_text=open_title,
+            annotation_position="top left",
+            annotation_font=dict(size=11, color=INK_MUTED),
+        )
     figure = style_axes(figure)
     figure.update_xaxes(title_text=x_title)
     figure.update_yaxes(range=[0, 10])
@@ -456,8 +588,14 @@ def period_totals(
     current: list[date],
     previous: list[date],
     sources: list[str],
+    window: tuple[date, date] | None = None,
 ) -> None:
-    """Среднее за период по источникам и разница с предыдущим таким же периодом."""
+    """Среднее за период по источникам и разница с предыдущим таким же периодом.
+
+    window - календарные границы расчётного окна. Нужны отдельно от списка
+    полных дней: если внутри недели день не собрался, «Период 08.09 - 13.09»
+    соврал бы про границы недели, которая на деле началась 07.09.
+    """
     st.subheader("Итог периода")
     now = window_average(frame, current)
     # Огрызок предыдущего периода в сравнение не идёт: цифра дельты читается
@@ -480,9 +618,15 @@ def period_totals(
             delta_color="inverse",
         )
 
+    bounds = span(list(window)) if window else span(current)
+    missing = (
+        ""
+        if window is None or len(current) == (window[1] - window[0]).days + 1
+        else ", остальные собраны не полностью и в расчёт не вошли"
+    )
     st.caption(
-        f"Период {span(current)}: {plural_days(len(current))} с полным сбором "
-        "по 17 часов. Незаконченные сутки в средние не входят."
+        f"Период {bounds}: в расчёте {plural_days(len(current))} с полным "
+        f"сбором по {FULL_DAY_HOURS} часов{missing}."
     )
     if not previous:
         st.caption("Предыдущего периода в данных нет - сравнивать не с чем.")
@@ -506,7 +650,9 @@ def main() -> None:
     st.caption(
         "Балл пробок снимается раз в час с 7:00 до 23:00 по Иркутску "
         "(сборщик опрашивает источники каждые 10 минут, в час засчитывается первый удачный замер). "
-        "Источники считают по своим методикам - смотреть их рядом, а не смешивать."
+        "Источники считают по своим методикам - смотреть их рядом, а не смешивать. "
+        "Неделя и месяц - календарные: считается последний закрытый период, "
+        "текущий показан отдельно и в расчёт не идёт."
     )
 
     frame, origin = load_data(DATA_PATH)
@@ -524,11 +670,12 @@ def main() -> None:
         )
 
     # --- фильтры одной строкой над графиками ---
+    today = today_irkutsk()
     first_date, last_date = min(frame["date"]), max(frame["date"])
     filters = st.columns([2, 2, 3])
     with filters[0]:
         period_label = st.selectbox(
-            "Период", [*PERIOD_DAYS, ALL_TIME, CUSTOM], index=0
+            "Период", [*CALENDAR_PERIODS, ALL_TIME, CUSTOM], index=0
         )
     with filters[1]:
         available = sorted(frame["source"].unique())
@@ -539,12 +686,12 @@ def main() -> None:
             format_func=lambda s: SOURCE_TITLES.get(s, s),
         )
 
-    start, end = preset_range(frame, period_label)
+    start, end = preset_range(frame, period_label, today)
     if period_label == CUSTOM:
         with filters[2]:
             picked = st.date_input(
                 "С какого по какое",
-                value=preset_range(frame, WEEK),
+                value=preset_range(frame, WEEK, today),
                 min_value=first_date,
                 max_value=last_date,
                 format="DD.MM.YYYY",
@@ -555,22 +702,39 @@ def main() -> None:
         start = picked[0]
         end = picked[1] if len(picked) > 1 else last_date
 
-    # Любой период - это только полностью собранные сутки: сегодняшний неполный
-    # день и дни с дырами в сборе из него выпадают.
+    # Границы, которые запросил человек: ниже start/end съезжают на фактические
+    # полные сутки, а проверить попадание текущего дня надо по запрошенным.
+    wanted_start, wanted_end = min(start, end), max(start, end)
+
+    # Средние считаются только по полностью собранным суткам: дни с дырами в
+    # сборе из них выпадают.
+    complete = complete_days(frame, chosen) if chosen else []
     current_days, prev_days = (
-        period_windows(complete_days(frame, chosen), period_label, start, end)
-        if chosen
-        else ([], [])
+        period_windows(complete, period_label, start, end, today) if chosen else ([], [])
     )
-    if current_days:
-        start, end = current_days[0], current_days[-1]
+    # Дни текущего, ещё не закрывшегося периода: полные сутки этой недели плюс
+    # сегодняшний незаконченный день. Видно на графике, в расчёт не идут.
+    open_days: list[date] = []
+    if period_label in CALENDAR_PERIODS:
+        open_from, _ = open_window(period_label, today)
+        open_days = [day for day in complete if open_from <= day <= today]
+    partial = running_day(frame, complete, chosen, today)
+    if partial is not None and not wanted_start <= partial <= wanted_end:
+        partial = None
+    if partial is not None:
+        open_days.append(partial)
+
+    shown_days = sorted(set(current_days) | set(open_days))
+    if shown_days:
+        start, end = shown_days[0], shown_days[-1]
 
     period = slice_period(frame, start, end)
     period = period[period["source"].isin(chosen)] if chosen else period.iloc[0:0]
-    if current_days:
+    if shown_days:
         # Неполный день посреди периода (сбор падал) выбрасываем целиком: иначе
-        # он занижает и дневной график, и среднее за период.
-        period = period[period["date"].isin(current_days)]
+        # он занижает и дневной график, и среднее за период. Сегодняшний день -
+        # исключение, он в списке показанных.
+        period = period[period["date"].isin(shown_days)]
     # Замеры вне 7:00-23:00 - это опоздавшие запуски сборщика, сползшие за
     # полночь. В средние и в полноту они не идут, но и не пропадают: счётчик
     # под таблицей показывает, сколько их.
@@ -583,10 +747,22 @@ def main() -> None:
         )
         return
 
-    if not current_days:
+    open_title = (
+        "текущая неделя" if period_label in (WEEK, TWO_WEEKS)
+        else "текущий месяц" if period_label == MONTH
+        else "сегодня"
+    )
+    if not current_days and not open_days:
         st.caption(
-            "В этом периоде нет ни одних полностью собранных суток (17 часов "
-            "подряд) - показано всё как есть, включая незаконченные дни."
+            f"В этом периоде нет ни одних полностью собранных суток "
+            f"({FULL_DAY_HOURS} часов подряд) - показано всё как есть, включая "
+            "незаконченные дни."
+        )
+    elif not current_days:
+        st.caption(
+            f"Полностью собранных суток ({FULL_DAY_HOURS} часов подряд) в "
+            f"закрытом периоде нет - показан только {open_title}, считать и "
+            "сравнивать пока нечего."
         )
 
     # --- контекст дня: погода тянется сама, заметки пишет человек ---
@@ -601,6 +777,9 @@ def main() -> None:
     # --- KPI ---
     daily = daily_average(period)
     latest_ts = period["ts_local"].max()
+    # Полные сутки периода: на них считаются все средние. Текущий день сюда не
+    # входит - его среднее ещё вырастет к вечеру.
+    full_period = period[period["date"].isin(current_days)] if current_days else period
     # Последний день считается внутри периода: при своих датах последний замер
     # всей истории может лежать далеко за правой границей.
     tiles = st.columns(len(chosen) + 2)
@@ -608,14 +787,17 @@ def main() -> None:
         source_rows = period[period["source"] == source].sort_values("ts_local")
         last_score = source_rows["score"].iloc[-1]
         last_time = str(source_rows["ts_local"].iloc[-1])[11:16]
-        today = daily[(daily["source"] == source) & (daily["date"] == period_last)]
-        today_avg = today["score"].iloc[0] if not today.empty else float("nan")
+        last_day = daily[(daily["source"] == source) & (daily["date"] == period_last)]
+        last_avg = last_day["score"].iloc[0] if not last_day.empty else float("nan")
+        running = " (идёт)" if period_last == partial else ""
         column.metric(
-            f"{SOURCE_TITLES.get(source, source)}: среднее за {period_last:%d.%m}",
-            "-" if pd.isna(today_avg) else f"{today_avg:.1f}",
+            f"{SOURCE_TITLES.get(source, source)}: среднее за {period_last:%d.%m}{running}",
+            "-" if pd.isna(last_avg) else f"{last_avg:.1f}",
         )
         column.caption(f"последний замер {last_score:g} в {last_time}")
-    tiles[-2].metric("Среднее за период", f"{period['score'].mean():.2f}")
+    tiles[-2].metric("Среднее за период", f"{full_period['score'].mean():.2f}")
+    if open_days and current_days:
+        tiles[-2].caption(f"по закрытому периоду, без дней «{open_title}»")
 
     # Дни внутри периода считаются целиком, поэтому полностью пропущенные
     # сутки видны. Края - по факту первого и последнего замера.
@@ -632,6 +814,21 @@ def main() -> None:
         ),
     )
 
+    if open_days and current_days:
+        where = span(open_days) if len(open_days) > 1 else f"{open_days[0]:%d.%m}"
+        st.caption(
+            f"Жёлтым справа - {open_title} ({where}). Период ещё не закрылся, "
+            "поэтому эти дни видно, но в средние и в сравнение они не идут - "
+            "войдут, когда период закончится."
+        )
+    if partial is not None:
+        done = collected_hours(period, partial, chosen)
+        st.caption(
+            f"{partial:%d.%m} - сутки ещё идут: собрано {done} из {FULL_DAY_HOURS} "
+            "часов, на графике день отмечен полой точкой. Вечерний пик ещё "
+            "впереди, и цифра дня к ночи вырастет."
+        )
+
     if context.get(period_last):
         st.caption(f"{period_last:%d.%m}: {context[period_last]}")
 
@@ -641,17 +838,35 @@ def main() -> None:
     with left:
         st.subheader("Средний балл по дням")
         st.plotly_chart(
-            line_by_source(daily, "date", "Дата", context=context), width="stretch"
+            line_by_source(
+                daily,
+                "date",
+                "Дата",
+                context=context,
+                partial=partial,
+                open_from=min(open_days) if open_days else None,
+                open_title=open_title,
+            ),
+            width="stretch",
         )
     with right:
         st.subheader("Профиль по часам")
+        # Профиль - по полным суткам: у текущего дня есть только утро, и оно
+        # перевесило бы утренние часы относительно вечерних.
         hourly = (
-            period.groupby(["hour", "source"], as_index=False)["score"].mean().round(2)
+            full_period.groupby(["hour", "source"], as_index=False)["score"]
+            .mean()
+            .round(2)
         )
         st.plotly_chart(line_by_source(hourly, "hour", "Час"), width="stretch")
 
     if current_days:
-        period_totals(frame, current_days, prev_days, chosen)
+        window = (
+            preset_window(period_label, complete, today)[0]
+            if period_label in CALENDAR_PERIODS
+            else None
+        )
+        period_totals(frame, current_days, prev_days, chosen, window)
 
     st.subheader("День и час: где скапливаются пробки")
     heat_source = st.radio(
@@ -669,6 +884,12 @@ def main() -> None:
     with st.expander("Таблица: средние по дням"):
         table = daily.pivot(index="date", columns="source", values="score")
         table.columns = [SOURCE_TITLES.get(c, c) for c in table.columns]
+        # Колонка нужна только когда есть незаконченный день: иначе в таблице
+        # стояла бы полоса одинаковых семнадцаток без смысла.
+        if partial is not None:
+            table[f"Часов из {FULL_DAY_HOURS}"] = [
+                collected_hours(period, day, chosen) for day in table.index
+            ]
         # Контекст идёт последними колонками: сначала цифра, потом объяснение.
         table["Погода"] = [weather.get(day, "") for day in table.index]
         table["Заметка"] = [notes.get(day, "") for day in table.index]

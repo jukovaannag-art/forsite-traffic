@@ -293,6 +293,23 @@ def running_day(
     return today if collected_hours(frame, today, sources) else None
 
 
+def heat_days(complete: list[date], partial: date | None, count: int = 7) -> list[date]:
+    """Дни для тепловой карты: последние `count` полных суток плюс текущие.
+
+    Карта живёт своей жизнью, независимо от выбранного периода: на ней ищут
+    часы пик, а они меняются неделями, и месяц клеток читать невозможно.
+    Полных дней может быть меньше семи - тогда показываем сколько есть.
+    Когда сегодняшние сутки уже собраны целиком, текущего дня нет - ширина
+    карты сохраняется за счёт лишнего полного дня.
+    """
+    if partial is None:
+        return sorted(complete)[-(count + 1) :]
+    recent = sorted(complete)[-count:]
+    if partial not in recent:
+        recent.append(partial)
+    return sorted(recent)
+
+
 def period_windows(
     days: list[date], label: str, start: date, end: date, today: date
 ) -> tuple[list[date], list[date]]:
@@ -869,6 +886,20 @@ def main() -> None:
         period_totals(frame, current_days, prev_days, chosen, window)
 
     st.subheader("День и час: где скапливаются пробки")
+    # Карта не слушает фильтр периода: часы пик ищут по свежей неделе, а месяц
+    # клеток нечитаем. Берём последние 7 полных суток и текущий день сверху.
+    # partial выше обнуляется, если сегодня вне выбранного периода - карте он
+    # нужен всегда, поэтому спрашиваем заново.
+    heat_partial = running_day(frame, complete, chosen, today)
+    days_for_heat = heat_days(complete, heat_partial)
+    if not days_for_heat:
+        # Ни одних полных суток - показываем то, что есть в выбранном периоде.
+        days_for_heat = sorted(set(period["date"]))[-8:]
+    heat_frame = frame[
+        frame["date"].isin(days_for_heat)
+        & frame["source"].isin(chosen)
+        & frame["hour"].between(HOUR_FROM, HOUR_TO)
+    ]
     heat_source = st.radio(
         "Источник для карты",
         chosen,
@@ -876,7 +907,17 @@ def main() -> None:
         format_func=lambda s: SOURCE_TITLES.get(s, s),
         label_visibility="collapsed",
     )
-    st.plotly_chart(heatmap(period, heat_source), width="stretch")
+    st.plotly_chart(heatmap(heat_frame, heat_source), width="stretch")
+    tail = (
+        ": правый столбец - сегодняшний день, он собран не целиком"
+        if heat_partial is not None and heat_partial in days_for_heat
+        else ""
+    )
+    st.caption(
+        f"Последние {len(days_for_heat)} дней "
+        f"({min(days_for_heat):%d.%m} - {max(days_for_heat):%d.%m}), "
+        f"независимо от выбранного периода{tail}."
+    )
 
     st.subheader("Что было в этот день")
     note_editor(sorted(period["date"].unique()), period_last, weather, notes)

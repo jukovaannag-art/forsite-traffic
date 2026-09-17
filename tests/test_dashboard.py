@@ -18,6 +18,7 @@ from dashboard.app import (  # noqa: E402
     collected_hours,
     complete_days,
     expected_slots,
+    heat_days,
     month_start,
     open_window,
     period_windows,
@@ -389,3 +390,26 @@ def test_перепутанные_границы_не_дают_пустой_пе
     forward = slice_period(_ten_days(), date(2026, 8, 19), date(2026, 8, 21))
     backward = slice_period(_ten_days(), date(2026, 8, 21), date(2026, 8, 19))
     assert len(backward) == len(forward) == 3
+
+
+def test_карта_показывает_семь_полных_дней_и_текущий() -> None:
+    complete = [date(2026, 9, 1) + timedelta(days=i) for i in range(10)]
+    days = heat_days(complete, date(2026, 9, 11))
+    assert len(days) == 8
+    assert days[0] == date(2026, 9, 4)
+    assert days[-1] == date(2026, 9, 11)
+
+
+def test_карта_без_текущего_дня_добирает_полным() -> None:
+    complete = [date(2026, 9, 1) + timedelta(days=i) for i in range(10)]
+    days = heat_days(complete, None)
+    assert len(days) == 8
+    assert days[-1] == date(2026, 9, 10)
+
+
+def test_карта_коротких_данных_показывает_что_есть() -> None:
+    assert heat_days([date(2026, 9, 1)], date(2026, 9, 2)) == [
+        date(2026, 9, 1),
+        date(2026, 9, 2),
+    ]
+    assert heat_days([], None) == []
